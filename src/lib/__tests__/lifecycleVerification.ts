@@ -144,7 +144,7 @@ export async function runLifecycleVerificationSuite(): Promise<LifecycleVerifica
   // 3. A failed action cannot become verified success
   await runTest('3. A failed action cannot become verified success', () => {
     const res = actionExecutionGateway.dispatch({
-      source: 'command_dispatch',
+      source: 'direct_command',
       capabilityId: 'workspace_navigation',
       intent: 'open',
       target: 'completely_unknown_screen_xyz',
@@ -227,9 +227,9 @@ export async function runLifecycleVerificationSuite(): Promise<LifecycleVerifica
         intent: 'telemetry',
       },
       {
-        exclusivity: 'prefer_best_effort',
+        exclusivity: 'preferred',
         maxAttempts: 2,
-        preferredMethod: 'live_telemetry',
+        allowAutonomousFallback: true,
       },
       { currentScreen: 'chat' as any }
     );
@@ -274,7 +274,7 @@ export async function runLifecycleVerificationSuite(): Promise<LifecycleVerifica
     const executionId = `idemp_test_${Date.now()}`;
     const req = {
       executionId,
-      source: 'command_dispatch' as const,
+      source: 'contextual_action' as const,
       capabilityId: 'workspace_navigation',
       intent: 'open',
       target: 'library',
@@ -304,7 +304,7 @@ export async function runLifecycleVerificationSuite(): Promise<LifecycleVerifica
       description: 'Open Tools',
       requiresConfirmation: true, // Needs confirmation
     };
-    const plan = createSingleActionPlan(action, 'confirm');
+    const plan = createSingleActionPlan(action, 'confirmation');
     const outcome = executeActionPlanSync(plan, {});
     const node = plan.actions[0];
 
