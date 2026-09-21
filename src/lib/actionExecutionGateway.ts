@@ -470,6 +470,26 @@ export class UnifiedActionExecutionGateway {
       fallbackPolicy,
     } = request;
 
+    // 1b. Cancellation Check
+    if (context?.cancellationToken?.isCancelled) {
+      return {
+        executionId: execId,
+        capabilityId,
+        actionId: request.actionId,
+        intent,
+        target,
+        parameters,
+        status: 'failed',
+        executed: false,
+        verified: false,
+        success: false,
+        failureCategory: 'user_cancellation',
+        failureReason: context.cancellationToken.reason || 'Action execution was cancelled.',
+        response: `Execution cancelled: ${context.cancellationToken.reason || 'Action was cancelled by user.'}`,
+        completedAt: Date.now(),
+      };
+    }
+
     // 2. User Constraint Enforcement (e.g. "don't use Y", "only use X")
     if (userConstraints?.prohibitedCapabilities?.includes(capabilityId)) {
       return {
@@ -641,14 +661,15 @@ export class UnifiedActionExecutionGateway {
         context
       );
 
+      const isRequiresConfirmation = adaptiveRes.status === 'requires_confirmation';
       const isSucceeded = adaptiveRes.status === 'succeeded';
       return {
         executionId: execId,
         capabilityId,
         actionId: request.actionId,
         intent,
-        status: isSucceeded ? 'completed' : 'failed',
-        executed: true,
+        status: isRequiresConfirmation ? 'requires_confirmation' : isSucceeded ? 'completed' : 'failed',
+        executed: isRequiresConfirmation ? false : (adaptiveRes.attempts.length > 0),
         verified: adaptiveRes.isVerified,
         success: isSucceeded && adaptiveRes.isVerified,
         result: adaptiveRes.finalResult,
@@ -867,14 +888,15 @@ export class UnifiedActionExecutionGateway {
       context
     );
 
+    const isRequiresConfirmation = adaptiveRes.status === 'requires_confirmation';
     const isSucceeded = adaptiveRes.status === 'succeeded';
     return {
       executionId: execId,
       capabilityId,
       actionId: request.actionId,
       intent,
-      status: isSucceeded ? 'completed' : 'failed',
-      executed: true,
+      status: isRequiresConfirmation ? 'requires_confirmation' : isSucceeded ? 'completed' : 'failed',
+      executed: isRequiresConfirmation ? false : (adaptiveRes.attempts.length > 0),
       verified: adaptiveRes.isVerified,
       success: isSucceeded && adaptiveRes.isVerified,
       result: adaptiveRes.finalResult,
@@ -921,6 +943,30 @@ export class UnifiedActionExecutionGateway {
       confirmedBy?: 'user_click' | 'explicit_command' | 'dialog' | 'suggestion_activation';
     }
   ): ActionExecutionResult {
+    if (plan.cancellationToken?.isCancelled) {
+      return {
+        executionId: `step_${plan.id}_${step.id}`,
+        capabilityId: step.capabilityId,
+        actionId: step.id,
+        intent: step.intent,
+        target: step.target,
+        parameters: step.parameters,
+        status: 'failed',
+        executed: false,
+        verified: false,
+        success: false,
+        failureCategory: 'user_cancellation',
+        failureReason: plan.cancellationToken.reason || 'Plan was cancelled by user.',
+        response: `Plan cancelled: ${plan.cancellationToken.reason || 'Execution aborted.'}`,
+        completedAt: Date.now(),
+      };
+    }
+
+    const mergedContext: CapabilityExecutionContext = {
+      ...context,
+      cancellationToken: plan.cancellationToken || context.cancellationToken,
+    };
+
     const request: ActionExecutionRequest = {
       executionId: `step_${plan.id}_${step.id}`,
       source: 'action_plan',
@@ -944,7 +990,7 @@ export class UnifiedActionExecutionGateway {
         confirmedBy: options?.confirmedBy,
       },
       fallbackPolicy: step.fallbackPolicy || plan.adaptivePolicy,
-      context,
+      context: mergedContext,
     };
 
     return this.dispatch(request);

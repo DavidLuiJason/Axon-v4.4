@@ -175,6 +175,7 @@ export interface CapabilityExecutionContext {
   settingsHandlers?: any;
   storageHandlers?: any;
   customHandlers?: Record<string, Function>;
+  cancellationToken?: { isCancelled: boolean; reason?: string };
 }
 
 export interface CapabilityExecutionResult {

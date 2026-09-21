@@ -40,8 +40,10 @@ import {
   CapabilityExecutionContext,
   systemCapabilityRegistry,
 } from './capabilitySystem';
+import type { InvocationSource, AuthorizationLevel } from './capabilityContract';
 import { resolveInterfaceFromQuery } from './interfaceRegistry';
 import { tryEvaluateMathExpression } from './storageChatHandler';
+import { actionExecutionGateway } from './actionExecutionGateway';
 import type {
   FailureCategory,
   MethodExclusivity,
@@ -125,6 +127,9 @@ export interface ActionNode {
   status?: ActionStatus;
   dependencies?: ActionDependency[];
   requiresConfirmation?: boolean;
+  authorizationLevel?: AuthorizationLevel;
+  requiresCommandAuthorization?: boolean;
+  invocationSource?: InvocationSource;
   result?: any;
   error?: {
     message: string;
@@ -549,7 +554,8 @@ export function evaluateActionDependencies(
 }
 
 /**
- * Executes a single action node using registered system capabilities or execution context.
+ * Executes a single action node using registered system capabilities or execution context
+ * via the Unified Action Execution Gateway.
  */
 export function executeActionNodeDirect(
   action: ActionNode,
@@ -562,196 +568,57 @@ export function executeActionNodeDirect(
   targetScreen?: ScreenId;
   attempts?: ExecutionAttempt[];
 } {
-  if (action.fallbackPolicy) {
-    const adaptiveRes = executeAdaptiveObjectiveSync(
-      action.description,
-      {
-        capabilityId: action.capabilityId,
-        methodId: action.intent || action.capabilityId,
-        methodName: action.description || action.capabilityId,
-        intent: action.intent,
-        target: action.target,
-        parameters: action.parameters,
-      },
-      action.fallbackPolicy,
-      context
-    );
-    action.attempts = adaptiveRes.attempts;
-    action.completedAt = Date.now();
-    if (adaptiveRes.status === 'succeeded') {
-      action.status = 'completed';
-      action.result = adaptiveRes.finalResult;
-      return {
-        success: true,
-        result: action.result,
-        response: adaptiveRes.response,
-        targetScreen: adaptiveRes.targetScreen,
-        attempts: adaptiveRes.attempts,
-      };
-    } else {
-      action.status = 'failed';
-      action.error = { message: adaptiveRes.limitation || 'Action execution failed.' };
-      return {
-        success: false,
-        error: action.error,
-        response: adaptiveRes.response,
-        attempts: adaptiveRes.attempts,
-      };
-    }
-  }
-
   action.startedAt = Date.now();
   action.status = 'executing';
 
-  const singleAttempt: ExecutionAttempt = {
-    id: `att_${Date.now()}_1`,
-    attemptIndex: 1,
-    objective: action.description,
-    methodId: action.intent || action.capabilityId,
+  const gatewayRes = actionExecutionGateway.dispatch({
+    executionId: `node_${action.id}_${Date.now()}`,
+    source: 'action_plan',
     capabilityId: action.capabilityId,
-    methodName: action.description,
+    actionId: action.id,
+    intent: action.intent,
     target: action.target,
     parameters: action.parameters,
-    isPreferredMethod: true,
-    status: 'attempting',
-    startedAt: action.startedAt,
-    verified: false,
-  };
+    executionPolicy: action.executionPolicy || 'execute',
+    originatingStep: {
+      id: action.id,
+      description: action.description,
+      status: action.status,
+      requiresConfirmation: action.requiresConfirmation,
+    },
+    confirmationState: {
+      isConfirmed: !action.requiresConfirmation,
+    },
+    fallbackPolicy: action.fallbackPolicy,
+    context,
+  });
 
-  try {
-    // 1. Registered Capability Execution
-    const cap = systemCapabilityRegistry.get(action.capabilityId);
-    if (cap && cap.execute) {
-      const execResult = cap.execute(
-        action.intent,
-        action.target,
-        action.parameters || {},
-        context
-      );
-
-      const syncRes = execResult as any;
-      if (syncRes && syncRes.success === false) {
-        action.status = 'failed';
-        action.error = { message: syncRes.response || 'Capability execution failed.' };
-        action.completedAt = Date.now();
-        singleAttempt.status = 'failed';
-        singleAttempt.failureReason = action.error.message;
-        singleAttempt.completedAt = action.completedAt;
-        recordAttempt(singleAttempt);
-        action.attempts = [singleAttempt];
-        return { success: false, error: action.error, response: syncRes.response, attempts: action.attempts };
-      }
-
-      action.status = 'completed';
-      action.result = syncRes?.metadata || syncRes;
-      action.completedAt = Date.now();
-      singleAttempt.status = 'succeeded';
-      singleAttempt.verified = true;
-      singleAttempt.result = action.result;
-      singleAttempt.completedAt = action.completedAt;
-      recordAttempt(singleAttempt);
-      action.attempts = [singleAttempt];
-      return {
-        success: true,
-        result: action.result,
-        response: syncRes?.response,
-        targetScreen: syncRes?.targetScreen,
-        attempts: action.attempts,
-      };
-    }
-
-    // 2. Direct Navigation Execution
-    if (action.capabilityId === 'workspace_navigation' || action.intent === 'open') {
-      const target = action.target || '';
-      if (!context.navigateTo) {
-        action.status = 'failed';
-        action.error = { message: 'Navigation context is not available.' };
-        action.completedAt = Date.now();
-        singleAttempt.status = 'failed';
-        singleAttempt.failureReason = action.error.message;
-        recordAttempt(singleAttempt);
-        action.attempts = [singleAttempt];
-        return { success: false, error: action.error, attempts: action.attempts };
-      }
-
-      const res = resolveInterfaceFromQuery(target, context.currentScreen);
-      if (res.match && res.match.route) {
-        context.navigateTo(res.match.route as ScreenId, {
-          screenState: res.match.subState,
-        });
-        action.status = 'completed';
-        action.result = { screen: res.match.route };
-        action.completedAt = Date.now();
-        singleAttempt.status = 'succeeded';
-        singleAttempt.verified = true;
-        singleAttempt.result = action.result;
-        recordAttempt(singleAttempt);
-        action.attempts = [singleAttempt];
-        return {
-          success: true,
-          result: action.result,
-          response: `Opened **${res.match.name}**.`,
-          targetScreen: res.match.route as ScreenId,
-          attempts: action.attempts,
-        };
-      }
-
-      action.status = 'failed';
-      action.error = { message: `Could not identify interface for "${target}".` };
-      action.completedAt = Date.now();
-      singleAttempt.status = 'failed';
-      singleAttempt.failureReason = action.error.message;
-      recordAttempt(singleAttempt);
-      action.attempts = [singleAttempt];
-      return { success: false, error: action.error, attempts: action.attempts };
-    }
-
-    // 3. Direct Math Calculation Execution
-    if (action.capabilityId === 'math_calculator' || action.intent === 'calculate') {
-      const expr = action.parameters?.expression || action.target || '';
-      const calcResult = tryEvaluateMathExpression(expr);
-      if (calcResult) {
-        action.status = 'completed';
-        action.result = { calculation: calcResult };
-        action.completedAt = Date.now();
-        singleAttempt.status = 'succeeded';
-        singleAttempt.verified = true;
-        singleAttempt.result = action.result;
-        recordAttempt(singleAttempt);
-        action.attempts = [singleAttempt];
-        return { success: true, result: action.result, response: calcResult, attempts: action.attempts };
-      }
-
-      action.status = 'failed';
-      action.error = { message: `Could not calculate "${expr}".` };
-      action.completedAt = Date.now();
-      singleAttempt.status = 'failed';
-      singleAttempt.failureReason = action.error.message;
-      recordAttempt(singleAttempt);
-      action.attempts = [singleAttempt];
-      return { success: false, error: action.error, attempts: action.attempts };
-    }
-
-    // 4. Default Success
+  if (gatewayRes.status === 'completed' && gatewayRes.success) {
     action.status = 'completed';
-    action.result = { description: action.description };
-    action.completedAt = Date.now();
-    singleAttempt.status = 'succeeded';
-    singleAttempt.verified = true;
-    singleAttempt.result = action.result;
-    recordAttempt(singleAttempt);
-    action.attempts = [singleAttempt];
-    return { success: true, result: action.result, attempts: action.attempts };
-  } catch (err: any) {
+  } else if (gatewayRes.status === 'requires_confirmation' || gatewayRes.status === 'requires_interaction') {
+    action.status = 'waiting';
+  } else if (gatewayRes.status === 'skipped') {
+    action.status = 'skipped';
+  } else if (gatewayRes.failureCategory === 'user_cancellation') {
+    action.status = 'cancelled';
+  } else {
     action.status = 'failed';
-    action.error = { message: err?.message || String(err) };
-    action.completedAt = Date.now();
-    singleAttempt.status = 'failed';
-    singleAttempt.failureReason = action.error.message;
-    recordAttempt(singleAttempt);
-    action.attempts = [singleAttempt];
-    return { success: false, error: action.error, attempts: action.attempts };
   }
+  action.result = gatewayRes.result;
+  action.attempts = gatewayRes.attempts;
+  action.completedAt = gatewayRes.completedAt;
+  if (!gatewayRes.success) {
+    action.error = gatewayRes.error || { message: gatewayRes.failureReason || 'Action execution failed.' };
+  }
+
+  return {
+    success: gatewayRes.success,
+    result: gatewayRes.result,
+    error: action.error,
+    response: gatewayRes.response,
+    targetScreen: gatewayRes.targetScreen,
+    attempts: gatewayRes.attempts,
+  };
 }
 
 /**
@@ -763,7 +630,33 @@ export function executeActionPlanSync(
   plan: ActionExecutionPlan,
   context: CapabilityExecutionContext
 ): PlanExecutionResult {
+  const mergedContext: CapabilityExecutionContext = {
+    ...context,
+    cancellationToken: plan.cancellationToken || context.cancellationToken,
+  };
+
   plan.startedAt = Date.now();
+
+  if (plan.cancellationToken?.isCancelled) {
+    plan.status = 'cancelled';
+    plan.actions.forEach((a) => {
+      a.status = 'cancelled';
+      a.error = { message: plan.cancellationToken?.reason || 'Plan was cancelled by user.' };
+    });
+    return {
+      planId: plan.id,
+      status: 'cancelled',
+      executed: false,
+      summary: `Plan cancelled: ${plan.cancellationToken.reason || 'Execution aborted.'}`,
+      results: {},
+      errors: {},
+      completedActionIds: [],
+      failedActionIds: plan.actions.map((a) => a.id),
+      skippedActionIds: [],
+      plan,
+    };
+  }
+
   plan.status = 'executing';
 
   const completedIds: string[] = [];
@@ -794,55 +687,38 @@ export function executeActionPlanSync(
       };
     }
 
-    const fallbackPolicy = act.fallbackPolicy || plan.adaptivePolicy || {
-      exclusivity: 'preferred',
-      maxAttempts: 3,
-      allowAutonomousFallback: true,
-    };
+    const gatewayRes = actionExecutionGateway.executePlanStep(act, plan, mergedContext);
 
-    const preferredMethod = {
-      capabilityId: act.capabilityId,
-      methodId: act.intent || act.capabilityId,
-      methodName: act.description || act.capabilityId,
-      intent: act.intent,
-      target: act.target,
-      parameters: act.parameters,
-    };
+    act.attempts = gatewayRes.attempts;
+    plan.attempts = gatewayRes.attempts;
 
-    const adaptiveRes = executeAdaptiveObjectiveSync(
-      plan.objective || act.description,
-      preferredMethod,
-      fallbackPolicy,
-      context
-    );
-
-    act.attempts = adaptiveRes.attempts;
-    plan.attempts = adaptiveRes.attempts;
-
-    if (adaptiveRes.status === 'succeeded') {
+    if (gatewayRes.status === 'completed') {
+      act.status = 'completed';
       completedIds.push(act.id);
-      results[act.id] = adaptiveRes.finalResult;
+      results[act.id] = gatewayRes.result;
       plan.status = 'completed';
-      if (adaptiveRes.targetScreen) lastNavScreen = adaptiveRes.targetScreen;
-    } else if (adaptiveRes.status === 'requires_confirmation') {
+      if (gatewayRes.targetScreen) lastNavScreen = gatewayRes.targetScreen;
+    } else if (gatewayRes.status === 'requires_confirmation' || gatewayRes.status === 'requires_interaction') {
       plan.status = 'waiting';
+      act.status = 'waiting';
       return {
         planId: plan.id,
         status: 'waiting',
         executed: false,
-        summary: adaptiveRes.response,
+        summary: gatewayRes.response,
         results,
         errors,
         completedActionIds: completedIds,
         failedActionIds: failedIds,
         skippedActionIds: skippedIds,
         plan,
-        actions: adaptiveRes.actions,
-        attempts: adaptiveRes.attempts,
+        actions: gatewayRes.actions,
+        attempts: gatewayRes.attempts,
       };
     } else {
+      act.status = 'failed';
       failedIds.push(act.id);
-      errors[act.id] = { message: adaptiveRes.limitation || 'Action execution failed.' };
+      errors[act.id] = gatewayRes.error || { message: gatewayRes.failureReason || 'Action execution failed.' };
       plan.status = 'failed';
     }
 
@@ -855,7 +731,7 @@ export function executeActionPlanSync(
       planId: plan.id,
       status: plan.status,
       executed: plan.status === 'completed',
-      summary: adaptiveRes.response,
+      summary: gatewayRes.response,
       results,
       errors,
       completedActionIds: completedIds,
@@ -863,13 +739,15 @@ export function executeActionPlanSync(
       skippedActionIds: skippedIds,
       plan,
       targetScreen: lastNavScreen,
-      attempts: adaptiveRes.attempts,
-      adapted: adaptiveRes.adapted,
+      attempts: gatewayRes.attempts,
+      adapted: gatewayRes.adapted,
     };
   }
 
   // 2. Queue Plan
   if (plan.type === 'queue') {
+    let completedCount = 0;
+    let failedCount = 0;
     for (const act of plan.actions) {
       act.status = 'waiting';
       workloadManager.submit({
@@ -878,7 +756,19 @@ export function executeActionPlanSync(
         priority:
           typeof act.priority === 'number' ? act.priority : TaskPriority.NORMAL_BACKGROUND,
         execute: async () => {
-          const res = executeActionNodeDirect(act, context);
+          const res = executeActionNodeDirect(act, mergedContext);
+          if (res.success) {
+            completedCount++;
+            results[act.id] = res.result;
+          } else {
+            failedCount++;
+            errors[act.id] = res.error || { message: 'Queued task failed.' };
+          }
+          if (completedCount + failedCount === plan.actions.length) {
+            plan.status = failedCount === 0 ? 'completed' : completedCount > 0 ? 'partially_completed' : 'failed';
+            plan.completedAt = Date.now();
+            setLastExecutionPlan(plan);
+          }
           if (!res.success) {
             throw new Error(res.error?.message || 'Queued task failed.');
           }
@@ -916,6 +806,13 @@ export function executeActionPlanSync(
       continue;
     }
 
+    // Preserve already completed actions (e.g. from prior step execution)
+    if (act.status === 'completed') {
+      completedIds.push(act.id);
+      results[act.id] = act.result;
+      continue;
+    }
+
     // Evaluate dependencies
     const depCheck = evaluateActionDependencies(act, plan);
     if (depCheck.skipped) {
@@ -932,7 +829,7 @@ export function executeActionPlanSync(
     }
 
     // Execute eligible action
-    const execRes = executeActionNodeDirect(act, context);
+    const execRes = executeActionNodeDirect(act, mergedContext);
     if (execRes.success) {
       completedIds.push(act.id);
       results[act.id] = execRes.result;
@@ -945,12 +842,12 @@ export function executeActionPlanSync(
   }
 
   // Determine overall plan outcome
-  if (completedIds.length === plan.actions.length) {
+  if (plan.cancellationToken?.isCancelled) {
+    plan.status = 'cancelled';
+  } else if (completedIds.length === plan.actions.length) {
     plan.status = 'completed';
   } else if (completedIds.length > 0) {
     plan.status = 'partially_completed';
-  } else if (plan.cancellationToken?.isCancelled) {
-    plan.status = 'cancelled';
   } else {
     plan.status = 'failed';
   }
